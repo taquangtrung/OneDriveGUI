@@ -6,7 +6,9 @@ Supports both AppImage and source installations.
 """
 
 import os
+import sys
 import logging
+import shutil
 from pathlib import Path
 
 
@@ -22,23 +24,32 @@ def is_running_in_appimage() -> bool:
 
 def get_executable_path() -> str:
     """
-    Get the absolute path to the executable.
+    Get the Exec command for the autostart desktop entry.
 
     For AppImage installations, returns the path to the AppImage file.
-    For source/system installations, returns 'OneDriveGUI' (assumes it's in PATH).
+    For frozen (PyInstaller) builds, returns the path to the binary.
+    For system installations, returns the absolute path of the installed executable.
+    For source installations, returns the current interpreter plus the main script.
 
     Returns:
-        str: Executable path or command
+        str: Exec command with absolute, quoted paths
     """
     appimage_path = os.getenv("APPIMAGE")
     if appimage_path:
-        # Running in AppImage - use the AppImage path
-        # $APPIMAGE already resolves symlinks
-        return appimage_path
-    else:
-        # Running from source or system installation
-        # Use command name from PATH (works for AUR and other package managers)
-        return "OneDriveGUI"
+        return f'"{appimage_path}"'
+
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+
+    for exe_name in ("OneDriveGUI", "onedrivegui"):
+        exe_path = shutil.which(exe_name)
+        if exe_path:
+            return f'"{exe_path}"'
+
+    # Running from source, so no executable exists on PATH. A bare command name
+    # here would produce a desktop entry that silently fails at login.
+    main_script = Path(sys.argv[0]).resolve()
+    return f'"{sys.executable}" "{main_script}"'
 
 
 def get_autostart_file_path() -> Path:

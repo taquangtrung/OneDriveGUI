@@ -1,4 +1,4 @@
-from PySide6.QtCore import QTimer, QUrl, QFileInfo, Qt, Signal, Slot, QTimer
+from PySide6.QtCore import QTimer, QUrl, QFileInfo, Qt, Signal, Slot
 from PySide6.QtGui import QIcon, QPixmap, QDesktopServices
 from PySide6.QtWidgets import (
     QWidget,
@@ -9,6 +9,8 @@ from PySide6.QtWidgets import (
     QStackedLayout,
     QMessageBox,
     QStyledItemDelegate,
+    QStyle,
+    QApplication,
 )
 
 
@@ -46,7 +48,7 @@ from gui_settings_window import gui_settings_window
 import logging
 
 # from logger import logger
-from global_config import DIR_PATH, PROFILES_FILE
+from global_config import DIR_PATH, PROFILES_FILE, save_global_config
 
 try:
     from ui.ui_login import Ui_LoginWindow
@@ -62,6 +64,12 @@ except ImportError:
 
 class MainWindow(QMainWindow, Ui_MainWindow):
     def __init__(self):
+        # Expose this instance as main_window.main_window_instance so other modules
+        # (e.g. profile_settings_window) can reach it without a circular import.
+        import main_window
+
+        main_window.main_window_instance = self
+
         # Access setup_wizard from wizard module to avoid circular imports
         import wizard
 
@@ -75,6 +83,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.setupUi(self)
         self.setWindowTitle(f"OneDriveGUI v{version}")
         self.setWindowIcon(QIcon(DIR_PATH + "/resources/images/icons8-cloud-80.png"))
+        self.trash_icon = QApplication.style().standardIcon(QStyle.SP_TrashIcon)
 
         if gui_settings.get("frameless_window") == "True":
             self.setWindowFlags(Qt.FramelessWindowHint)
@@ -121,6 +130,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         """
         )
         self.stackedLayout = QStackedLayout()
+
+        # Account types already persisted in the profiles file. Used to detect
+        # when a type reported during sync still needs to be saved to disk.
+        self.saved_account_types = {profile: global_config[profile]["account_type"] for profile in global_config}
 
         self.profile_status_pages = {}
         for profile in global_config:
@@ -239,7 +252,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             pass
         elif reason == QSystemTrayIcon.Trigger:
             logging.debug("[GUI] Left clicked on tray icon")
-            self.hide() if self.isVisible() else self.show()
+            if not self.isVisible():
+                self.show()
+            elif self.isActiveWindow():
+                self.hide()
+            else:
+                self.activateWindow()
+                self.raise_()
         elif reason == QSystemTrayIcon.MiddleClick:
             pass
         else:
@@ -312,7 +331,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         version_label_text = ""
         version_tooltip_text = ""
         min_requirements_met = True
-        min_supported_version = 2500
+        min_supported_version = 20511  # Enforce minimum version of onedrive client to be 2.5.11, required for the in-browser login flow support added in GUI v1.3.2
 
         def get_latest_client_version():
             latest_url = "https://api.github.com/repos/abraunegg/onedrive/releases/latest"
@@ -329,8 +348,11 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 client_version_check = subprocess.check_output([client_bin_path, "--version"], stderr=subprocess.STDOUT)
                 installed_client_version = re.search(r"(v[0-9.]+)", str(client_version_check)).group(1)
 
-                installed_client_version_num = int(installed_client_version.replace("v", "").replace(".", ""))
-                installed_client_version_num = installed_client_version_num if len(str(installed_client_version_num)) > 3 else installed_client_version_num * 10
+                # Zero-pad each component (e.g. "2.5.9" -> "020509") so patch versions
+                # compare correctly regardless of digit count, instead of comparing the
+                # raw concatenated digits (which put "2.5.9" above "2.5.11").
+                version_parts = installed_client_version.replace("v", "").split(".")
+                installed_client_version_num = int("".join(part.zfill(2) for part in version_parts))
 
                 return installed_client_version, installed_client_version_num
 
@@ -718,14 +740,25 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         workers[profile_name].trigger_resync.connect(self.resync_auth_dialog)
         workers[profile_name].trigger_big_delete.connect(self.big_delete_auth_dialog)
+        workers[profile_name].browser_login_required.connect(self.show_browser_login_notification)
         workers[profile_name].update_progress_new.connect(self.event_update_progress)
         workers[profile_name].update_profile_status.connect(self.event_update_profile_status)
+        workers[profile_name].clear_warning.connect(self.clear_warning_handler)
         workers[profile_name].started.connect(lambda: logging.info(f"started worker {profile_name}"))
         workers[profile_name].finished.connect(lambda: logging.info(f"finished worker {profile_name}"))
         try:
             workers[profile_name].finished.connect(lambda: self.remove_worker(profile_name))
         except KeyError:
             logging.info(f"[GUI] The worker for profile {profile_name} is already stopped.")
+
+    def show_browser_login_notification(self, profile_name):
+        if self.tray:
+            self.tray.showMessage(
+                "OneDriveGUI - Login required",
+                f"Please complete the OneDrive login for '{profile_name}' in the web browser window that just opened.",
+                QSystemTrayIcon.Information,
+                10000,
+            )
 
     def resync_auth_dialog(self, profile_name):
         resync_question = QMessageBox(
@@ -797,6 +830,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.profile_status_pages[profile].label_free_space.setText(data["free_space"])
         self.profile_status_pages[profile].label_account_type.setText(data["account_type"])
 
+        # Persist the account type reported by the client so it survives a
+        # restart; the worker only updates the in-memory config. Saving here
+        # keeps config writes on the main thread.
+        if data["account_type"] and data["account_type"] != self.saved_account_types.get(profile):
+            self.saved_account_types[profile] = data["account_type"]
+            save_global_config(global_config)
+            logging.info(f"[{profile}] Saved account type: {data['account_type']}")
+
         # Handle error message display
         if "error_message" in data and data["error_message"]:
             # Show error icon with full error message in tooltip
@@ -807,6 +848,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             # Clear error icon
             self.profile_status_pages[profile].label_error_icon.clear()
             self.profile_status_pages[profile].label_error_icon.setToolTip("")
+
+    def clear_warning_handler(self, profile_name):
+        """Clear warning icon and tooltip for a profile when a new sync cycle starts."""
+        self.profile_status_pages[profile_name].label_error_icon.clear()
+        self.profile_status_pages[profile_name].label_error_icon.setToolTip("")
+        # Update tray icon to reflect the cleared warning state
+        self.update_tray_icon()
+        logging.debug(f"[{profile_name}] Cleared warning state before or after new sync cycle")
 
     def event_update_progress(self, data, profile):
         """
@@ -842,7 +891,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 item = self.profile_status_pages[profile].listWidget.item(row)
                 item_widget = self.profile_status_pages[profile].listWidget.itemWidget(item)
                 item_file_name = item_widget.get_file_name()
-                item_incomplete = item_widget.ls_progressBar.isVisible()
+                item_incomplete = item_widget.get_timestamp_text() == ""
 
                 if file_name == item_file_name and item_incomplete:
                     # If current file is already in the list and progress bar is not complete, update the existing item.
@@ -850,11 +899,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                     logging.debug("Updating list item")
 
                     item_widget.set_progress(int(progress))
-                    # item_widget.set_icon(file_path)
+                    item_widget.set_icon(file_path)
                     item_widget.hide_progress_bar(transfer_complete)
 
                     if file_operation == "Deleting":
                         item_widget.set_label_1(f"Deleted from {parent_dir}")
+                        item_widget.set_custom_icon(self.trash_icon)
                         item_widget.set_label_2(f"")
                         # Store timestamp and display for deleted files
                         if "timestamp" in data and data["timestamp"]:
@@ -923,6 +973,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
             if file_operation == "Deleting":
                 myQCustomQWidget.set_label_1(f"Deleted from {parent_dir}")
+                myQCustomQWidget.set_custom_icon(self.trash_icon)
                 myQCustomQWidget.set_label_2(f"")
                 # Store timestamp and display for deleted files
                 if "timestamp" in data and data["timestamp"]:
@@ -1045,6 +1096,18 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                             relative_time = format_relative_time(timestamp)
                             item_widget.set_timestamp(relative_time)
 
+    def _build_login_url(self, profile):
+        application_id = global_config[profile]["onedrive"]["application_id"].strip('"') or "d50ca740-c83f-4d1b-b616-12c519384f0c"
+        azure_tenant_id = global_config[profile]["onedrive"]["azure_tenant_id"].strip('"') or "common"
+        self.login_url = (
+            f"https://login.microsoftonline.com/{azure_tenant_id}/oauth2/v2.0/authorize"
+            f"?client_id={application_id}"
+            f"&scope=Files.ReadWrite%20Files.ReadWrite.All%20Sites.ReadWrite.All%20offline_access"
+            f"&response_type=code&prompt=login"
+            f"&redirect_uri=https://login.microsoftonline.com/{azure_tenant_id}/oauth2/nativeclient"
+        )
+        logging.debug(f"[GUI] Built login URL: {self.login_url}")
+
     def show_login(self, profile):
         # Show login window with QT WebEngine
         self.window1 = QWidget()
@@ -1057,14 +1120,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.config_file = global_config[profile]["config_file"].strip('"')
         self.config_dir = re.search(r"(.+)/.+$", self.config_file).group(1)
 
-        # use static URL for now. TODO: use auth files in the future
-        url = (
-            "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=d50ca740-c83f-4d1b-b616"
-            "-12c519384f0c&scope=Files.ReadWrite%20Files.ReadWrite.all%20Sites.Read.All%20Sites.ReadWrite.All"
-            "%20offline_access&response_type=code&prompt=login&redirect_uri=https://login.microsoftonline.com"
-            "/common/oauth2/nativeclient"
-        )
-        self.lw.loginFrame.setUrl(QUrl(url))
+        # Build login URL from profile config
+        self._build_login_url(profile)
+        self.lw.loginFrame.setUrl(QUrl(self.login_url))
 
         # Wait for user to login and obtain response URL
         self.lw.loginFrame.urlChanged.connect(lambda: self.get_response_url(self.lw.loginFrame.url().toString(), profile))
@@ -1080,6 +1138,15 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         self.config_file = global_config[profile]["config_file"].strip('"')
         self.config_dir = re.search(r"(.+)/.+$", self.config_file).group(1)
+
+        # Build login URL from profile config and update the label
+        self._build_login_url(profile)
+        self.lw2.label_2.setText(
+            f"<html><head/><body><p>1)Login to OneDrive in your browser by "
+            f'<a href="{self.login_url}"><span style=" text-decoration: underline; color:#5e81ac;">clicking this link.</span></a></p>'
+            f"<p>2)Copy the response URI from your browser's address bar to the below field. </p>"
+            f"<p>3)Press Save.</p></body></html>"
+        )
 
         self.lw2.label_2.setOpenExternalLinks(True)
         self.lw2.pushButton_login.setEnabled(False)
@@ -1357,7 +1424,8 @@ class ProfileStatusPage(QWidget, Ui_status_page):
 
     def open_sync_dir(self):
         sync_dir = global_config[self.profile_name]["onedrive"]["sync_dir"].strip('"')
-        url = QUrl(os.path.expanduser(sync_dir))
+        sync_dir_path = os.path.expanduser(sync_dir)
+        url = QUrl.fromLocalFile(sync_dir_path)
         QDesktopServices.openUrl(url)
 
     def show_gui_settings_window(self):
